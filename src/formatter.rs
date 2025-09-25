@@ -30,53 +30,44 @@ pub fn format_gdscript_with_config(
     content: &str,
     config: &FormatterConfig,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let mut formatter = Formatter::new(content.to_owned(), config.clone());
-
-    formatter.preprocess().format()?.postprocess().reorder();
-    formatter.finish()
+    let mut formatter = Formatter::new(config);
+    formatter.format(content.to_owned())
 }
 
-struct Formatter {
+pub struct Formatter<'a> {
     content: String,
-    config: FormatterConfig,
-    parser: Parser,
+    config: &'a FormatterConfig,
     input_tree: Tree,
     tree: Tree,
+    cache: FormatterCache,
 }
 
-impl Formatter {
+impl<'a> Formatter<'a> {
     #[inline(always)]
-    fn new(content: String, config: FormatterConfig) -> Self {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_gdscript::LANGUAGE.into())
-            .unwrap();
-        let input_tree = parser.parse(&content, None).unwrap();
+    pub fn new(config: &'a FormatterConfig) -> Self {
+        let mut cache = FormatterCache::new(config);
+        let input_tree = cache.parser.parse("", None).unwrap();
 
         Self {
-            content,
+            content: "".into(),
             config,
             tree: input_tree.clone(),
             input_tree,
-            parser,
+            cache,
         }
     }
 
     #[inline(always)]
-    fn format(&mut self) -> Result<&mut Self, Box<dyn std::error::Error>> {
-        let indent_string = if self.config.use_spaces {
-            " ".repeat(self.config.indent_size)
-        } else {
-            "\t".to_string()
-        };
+    pub fn format(&mut self, content: String) -> Result<String, Box<dyn std::error::Error>> {
+        self.content = content;
+        self.input_tree = self.cache.parser.parse(&self.content, None).unwrap();
+        self.tree = self.input_tree.clone();
+        self.preprocess().process()?.postprocess().reorder();
+        self.finish()
+    }
 
-        let language = Language {
-            name: "gdscript".to_owned(),
-            query: TopiaryQuery::new(&tree_sitter_gdscript::LANGUAGE.into(), QUERY).unwrap(),
-            grammar: tree_sitter_gdscript::LANGUAGE.into(),
-            indent: Some(indent_string),
-        };
-
+    #[inline(always)]
+    fn process(&mut self) -> Result<&mut Self, Box<dyn std::error::Error>> {
         let mut output = Vec::new();
         let mut writer = BufWriter::new(&mut output);
 
@@ -84,7 +75,7 @@ impl Formatter {
             self.tree.clone().into(),
             &self.content,
             &mut writer,
-            &language,
+            &self.cache.language,
             Operation::Format {
                 skip_idempotence: true,
                 tolerate_parsing_errors: true,
@@ -106,7 +97,11 @@ impl Formatter {
             return self;
         }
 
-        self.tree = self.parser.parse(&self.content, Some(&self.tree)).unwrap();
+        self.tree = self
+            .cache
+            .parser
+            .parse(&self.content, Some(&self.tree))
+            .unwrap();
         match crate::reorder::reorder_gdscript_elements(&self.tree, &self.content) {
             Ok(reordered) => {
                 self.content = reordered;
@@ -140,16 +135,20 @@ impl Formatter {
 
     /// Finishes formatting and returns the resulting file content.
     #[inline(always)]
-    fn finish(mut self) -> Result<String, Box<dyn std::error::Error>> {
+    pub fn finish(&mut self) -> Result<String, Box<dyn std::error::Error>> {
         if self.config.safe {
-            self.tree = self.parser.parse(&self.content, Some(&self.tree)).unwrap();
+            self.tree = self
+                .cache
+                .parser
+                .parse(&self.content, Some(&self.tree))
+                .unwrap();
 
-            if !compare_trees(self.input_tree, self.tree) {
+            if !compare_trees(&self.input_tree, &self.tree) {
                 return Err("Trees are different".into());
             }
         }
 
-        Ok(self.content)
+        Ok(std::mem::take(&mut self.content))
     }
 
     /// This function removes additional new line characters after `extends_statement`.
@@ -222,7 +221,7 @@ impl Formatter {
     /// This function runs postprocess passes that uses tree-sitter.
     #[inline(always)]
     fn postprocess_tree_sitter(&mut self) -> &mut Self {
-        self.tree = self.parser.parse(&self.content, None).unwrap();
+        self.tree = self.cache.parser.parse(&self.content, None).unwrap();
 
         self.handle_two_blank_line()
     }
@@ -289,7 +288,11 @@ impl Formatter {
         for edit in edits {
             self.tree.edit(&edit);
         }
-        self.tree = self.parser.parse(&self.content, Some(&self.tree)).unwrap();
+        self.tree = self
+            .cache
+            .parser
+            .parse(&self.content, Some(&self.tree))
+            .unwrap();
     }
 
     /// This function makes sure we have the correct vertical spacing between important definitions:
@@ -299,69 +302,44 @@ impl Formatter {
     /// This uses tree-sitter to find the relevant nodes and their positions.
     fn handle_two_blank_line(&mut self) -> &mut Self {
         let root = self.tree.root_node();
-        let queries = [
-            // We need two queries to catch all cases because variables can be placed above or below functions
-            // First query: variable, function, class, signal, const, enum followed by function, constructor, class, or variable
-            //
-            // NOTE: Nathan (GDQuest): This adds maybe 20-25% runtime to the program.
-            // I tried 2 other implementations by having a single query that'd find only functions, classes, and constructors and add 2 new lines between them.
-            // But the costly part is in accounting for comments and annotations between them. This solution ends up being slightly faster and simpler.
-            // Still, this is probably something that can be made faster in the future.
-            "(([(variable_statement) (function_definition) (class_definition) (signal_statement) (const_statement) (enum_definition) (constructor_definition)]) @first \
-            . (([(comment) (annotation)])* @comment . ([(function_definition) (constructor_definition) (class_definition)]) @second))",
-            // Second query: constructor or function followed by variable, signal, const, or enum
-            "(([(constructor_definition) (function_definition) (class_definition)]) @first \
-            . ([(variable_statement) (signal_statement) (const_statement) (enum_definition)]) @second)",
-        ];
 
-        let process_query =
-            |query_str: &str, new_lines_at: &mut Vec<(usize, tree_sitter::Point)>| {
-                let query = match Query::new(
-                    &tree_sitter::Language::new(tree_sitter_gdscript::LANGUAGE),
-                    query_str,
-                ) {
-                    Ok(q) => q,
-                    Err(err) => {
-                        panic!("Failed to create query: {}", err);
-                    }
-                };
-
-                let mut cursor = QueryCursor::new();
-                let mut matches = cursor.matches(&query, root, self.content.as_bytes());
-                while let Some(m) = matches.next() {
-                    let first_node = m.captures[0].node;
-                    if m.captures.len() == 3 {
-                        let comment_node = m.captures[1].node;
-                        let second_node = m.captures[2].node;
-                        // If the @comment is on the same line as the first node,
-                        // we'll add a blank line before the @second node
-                        if comment_node.start_position().row == first_node.start_position().row {
-                            // Find where to insert the new line (before any indentation)
-                            let mut byte_idx = second_node.start_byte();
-                            let mut position = second_node.start_position();
-                            position.column = 0;
-                            while self.content.as_bytes()[byte_idx] != b'\n' {
-                                byte_idx -= 1;
-                            }
-                            new_lines_at.push((byte_idx, position));
-                        } else {
-                            // Otherwise, add a blank line after the first node
-                            new_lines_at.push((first_node.end_byte(), first_node.end_position()));
+        let process_query = |query: &Query, new_lines_at: &mut Vec<(usize, tree_sitter::Point)>| {
+            let mut cursor = QueryCursor::new();
+            let mut matches = cursor.matches(query, root, self.content.as_bytes());
+            while let Some(m) = matches.next() {
+                let first_node = m.captures[0].node;
+                if m.captures.len() == 3 {
+                    let comment_node = m.captures[1].node;
+                    let second_node = m.captures[2].node;
+                    // If the @comment is on the same line as the first node,
+                    // we'll add a blank line before the @second node
+                    if comment_node.start_position().row == first_node.start_position().row {
+                        // Find where to insert the new line (before any indentation)
+                        let mut byte_idx = second_node.start_byte();
+                        let mut position = second_node.start_position();
+                        position.column = 0;
+                        while self.content.as_bytes()[byte_idx] != b'\n' {
+                            byte_idx -= 1;
                         }
+                        new_lines_at.push((byte_idx, position));
                     } else {
-                        // If there's no comment between the nodes, add a blank line after the first node
+                        // Otherwise, add a blank line after the first node
                         new_lines_at.push((first_node.end_byte(), first_node.end_position()));
                     }
+                } else {
+                    // If there's no comment between the nodes, add a blank line after the first node
+                    new_lines_at.push((first_node.end_byte(), first_node.end_position()));
                 }
-            };
+            }
+        };
 
         // First we need to find all the places where we should add blank lines.
         // We can't modify the content string while tree-sitter is borrowing it, so we
         // collect all the positions first, then make changes afterward.
         let mut new_lines_at = Vec::new();
 
-        for query_str in &queries {
-            process_query(query_str, &mut new_lines_at);
+        for query in &self.cache.handle_two_blank_line_queries {
+            process_query(query, &mut new_lines_at);
         }
 
         // We sort the positions in reverse order so that when we insert new lines,
@@ -397,6 +375,68 @@ impl Formatter {
     }
 }
 
+struct FormatterCache {
+    parser: Parser,
+    language: Language,
+    handle_two_blank_line_queries: [Query; 2],
+}
+
+impl FormatterCache {
+    pub fn new(config: &FormatterConfig) -> Self {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&tree_sitter_gdscript::LANGUAGE.into())
+            .unwrap();
+
+        let indent_string = if config.use_spaces {
+            " ".repeat(config.indent_size)
+        } else {
+            "\t".to_string()
+        };
+
+        let language = Language {
+            name: "gdscript".to_owned(),
+            query: TopiaryQuery::new(&tree_sitter_gdscript::LANGUAGE.into(), QUERY).unwrap(),
+            grammar: tree_sitter_gdscript::LANGUAGE.into(),
+            indent: Some(indent_string),
+        };
+
+        let queries = [
+            // We need two queries to catch all cases because variables can be placed above or below functions
+            // First query: variable, function, class, signal, const, enum followed by function, constructor, class, or variable
+            //
+            // NOTE: Nathan (GDQuest): This adds maybe 20-25% runtime to the program.
+            // I tried 2 other implementations by having a single query that'd find only functions, classes, and constructors and add 2 new lines between them.
+            // But the costly part is in accounting for comments and annotations between them. This solution ends up being slightly faster and simpler.
+            // Still, this is probably something that can be made faster in the future.
+            "(([(variable_statement) (function_definition) (class_definition) (signal_statement) (const_statement) (enum_definition) (constructor_definition)]) @first \
+            . (([(comment) (annotation)])* @comment . ([(function_definition) (constructor_definition) (class_definition)]) @second))",
+            // Second query: constructor or function followed by variable, signal, const, or enum
+            "(([(constructor_definition) (function_definition) (class_definition)]) @first \
+            . ([(variable_statement) (signal_statement) (const_statement) (enum_definition)]) @second)",
+        ];
+
+        let handle_two_blank_line_queries = [
+            Query::new(
+                &tree_sitter::Language::new(tree_sitter_gdscript::LANGUAGE),
+                queries[0],
+            )
+            .unwrap(),
+            Query::new(
+                &tree_sitter::Language::new(tree_sitter_gdscript::LANGUAGE),
+                queries[1],
+            )
+            .unwrap(),
+        ];
+
+        Self {
+            parser,
+            language,
+            handle_two_blank_line_queries,
+        }
+    }
+}
+
 /// Calculates end position of the `slice` counting from `start`
 fn calculate_end_position(mut start: Point, slice: &str) -> Point {
     for b in slice.as_bytes() {
@@ -411,7 +451,7 @@ fn calculate_end_position(mut start: Point, slice: &str) -> Point {
 }
 
 /// Returns true if both trees have the same structure.
-fn compare_trees(left_tree: Tree, right_tree: Tree) -> bool {
+fn compare_trees(left_tree: &Tree, right_tree: &Tree) -> bool {
     let mut left_cursor = left_tree.walk();
     let mut right_cursor = right_tree.walk();
 

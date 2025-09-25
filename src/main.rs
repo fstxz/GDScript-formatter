@@ -1,13 +1,19 @@
 use std::{
     env, fs,
     io::{self, IsTerminal, Read, Write},
+    net::{TcpListener, TcpStream},
     path::PathBuf,
 };
 
 use clap::{CommandFactory, Parser};
 use rayon::prelude::*;
 
-use gdscript_formatter::{FormatterConfig, formatter::format_gdscript_with_config};
+use gdscript_formatter::{
+    FormatterConfig,
+    formatter::{Formatter, format_gdscript_with_config},
+};
+
+const DAEMON_ADDR: &str = "localhost:27542";
 
 /// This struct is used to hold all the information about the result when
 /// formatting a single file. Now that we use parallel processing, we need to
@@ -80,6 +86,23 @@ struct Args {
         conflicts_with = "reorder_code"
     )]
     safe: bool,
+    #[arg(
+        long,
+        help = "Run the formatter in daemon mode. To connect to this daemeon and format, use --client."
+    )]
+    daemon: bool,
+    #[arg(
+        long,
+        help = "Run the formatter in client mode. Requires a running daemon."
+    )]
+    client: bool,
+    #[arg(
+        long,
+        help = "This will automatically start the daemon if it's not already running. Subsequent invocations of the formatter \
+        with this flag will use the daemon to format the code. The daemon will exit automatically after some time of inactivity. \
+        Don't use this flag together with --daemon and --client."
+    )]
+    auto_daemon: bool,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -99,13 +122,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         safe: args.safe,
     };
 
+    if args.daemon {
+        if args.client {
+            return Err("Can't be a daemon and client at the same time.".into());
+        }
+        return daemon_main(&config);
+    }
+
     if args.input.is_empty() {
         let mut input_content = String::new();
         io::stdin()
             .read_to_string(&mut input_content)
             .map_err(|error| format!("Failed to read from stdin: {}", error))?;
 
-        let formatted_content = format_gdscript_with_config(&input_content, &config)?;
+        let formatted_content = if args.client {
+            client_main(&input_content)
+        } else {
+            format_gdscript_with_config(&input_content, &config)
+        }?;
 
         if args.check {
             if input_content != formatted_content {
@@ -239,4 +273,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn terminal_clear_line() {
     eprint!("\r{}", " ".repeat(80));
+}
+
+// Packet format:
+//   uint32, little-endian | file content size
+//   byte array            | file content
+fn daemon_main(config: &FormatterConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind(DAEMON_ADDR)?;
+
+    let mut formatter = Formatter::new(config);
+
+    println!("Daemon started, listening for incoming connections...");
+    loop {
+        let (mut stream, _) = listener.accept()?;
+
+        let mut file_length_bytes = [0u8; 4];
+        stream.read_exact(&mut file_length_bytes)?;
+
+        let file_length = u32::from_le_bytes(file_length_bytes);
+
+        let mut file_buffer = vec![0; file_length as usize];
+        stream.read_exact(&mut file_buffer)?;
+
+        let content = String::from_utf8(file_buffer)?;
+
+        formatter.format(content)?;
+        let result = formatter.finish()?;
+
+        let content_length = result.len() as u32;
+        let mut buffer = Vec::with_capacity((content_length + 4) as usize);
+        buffer.extend_from_slice(&content_length.to_le_bytes());
+        buffer.extend_from_slice(result.as_bytes());
+        stream.write_all(&buffer)?;
+    }
+}
+
+fn client_main(content: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let content = content.to_owned();
+    let mut stream = TcpStream::connect(DAEMON_ADDR)?;
+
+    let content_length = content.len() as u32;
+    let mut buffer = Vec::with_capacity((content_length + 4) as usize);
+    buffer.extend_from_slice(&content_length.to_le_bytes());
+    buffer.extend_from_slice(content.as_bytes());
+    stream.write_all(&buffer)?;
+
+    let mut formatted_content_length_bytes = [0u8; 4];
+    stream.read_exact(&mut formatted_content_length_bytes)?;
+
+    let formatted_content_length = u32::from_le_bytes(formatted_content_length_bytes);
+    let mut formatted_content_buffer = vec![0; formatted_content_length as usize];
+    stream.read_exact(&mut formatted_content_buffer)?;
+    let formatted_content = String::from_utf8(formatted_content_buffer)?;
+    Ok(formatted_content)
 }
